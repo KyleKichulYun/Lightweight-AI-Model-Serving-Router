@@ -1,0 +1,42 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - serving.kyle.io
+  resources:
+  - modelautoscalers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - serving.kyle.io
+  resources:
+  - modelautoscalers/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - serving.kyle.io
+  resources:
+  - modelautoscalers/status
+  verbs:
+  - get
+  - patch
+  - update

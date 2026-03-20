@@ -1,0 +1,9 @@
+apiVersion: serving.kyle.io/v1alpha1
+kind: ModelAutoscaler
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: modelautoscaler-sample
+spec:
+  # TODO(user): Add fields here
