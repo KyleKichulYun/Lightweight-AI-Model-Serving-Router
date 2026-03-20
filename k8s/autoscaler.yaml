@@ -1,0 +1,11 @@
+apiVersion: serving.kyle.io/v1alpha1
+kind: ModelAutoscaler
+metadata:
+  name: my-ai-autoscaler
+  namespace: default
+spec:
+  targetDeployment: "dummy-ai-model"
+  metricsURL: "http://localhost:8080/metrics" # 라우터 포트포워딩 주소
+  targetRequestsPerPod: 2  # 파드 1개당 2개 이상의 요청이 쌓이면 늘림
+  minReplicas: 1
+  maxReplicas: 10
