@@ -60,6 +60,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	// 특정 엔드포인트(또는 루트 "/")를 로드밸런서에 매핑
 	http.HandleFunc("/api/summarize", loadBalancerHandler)
+	http.HandleFunc("/api/chat", loadBalancerHandler)
 	// [추가] 메트릭 라우팅 등록
 	http.HandleFunc("/metrics", metricsHandler)
 
