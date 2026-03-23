@@ -1,0 +1,33 @@
+# k8s/service-monitor.yaml
+
+# 1. 기존 Go 라우터 Service 업데이트 (포트 이름 추가)
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-router-svc
+  labels:
+    app: go-router
+spec:
+  selector:
+    app: go-router
+  ports:
+  - name: http # 👈 Prometheus가 찾아올 수 있도록 포트에 'http'라는 명찰을 달아줍니다.
+    protocol: TCP
+    port: 80
+    targetPort: 8080
+---
+# 2. Prometheus에게 수집 경로를 알려주는 ServiceMonitor 생성
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: go-router-monitor
+  labels:
+    release: prometheus # 👈 kube-prometheus-stack이 이 라벨을 보고 자동으로 인식합니다.
+spec:
+  selector:
+    matchLabels:
+      app: go-router # go-router 라벨이 붙은 Service를 찾아라!
+  endpoints:
+  - port: http       # 'http'라는 이름의 포트로 가서
+    path: /metrics   # '/metrics' 경로를
+    interval: 10s    # 10초마다 긁어와라!
