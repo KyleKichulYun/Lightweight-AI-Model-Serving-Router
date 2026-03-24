@@ -1,0 +1,12 @@
+# k8s/doppler.yaml
+apiVersion: secrets.doppler.com/v1alpha1
+kind: DopplerSecret
+metadata:
+  name: sync-ai-secrets
+  namespace: default
+spec:
+  tokenSecret:
+    name: doppler-token-secret
+    namespace: default    # 👈 [핵심] 여기를 doppler-operator-system에서 default로 변경!
+  managedSecret:
+    name: ai-secrets

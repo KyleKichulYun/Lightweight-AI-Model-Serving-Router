@@ -22,6 +22,10 @@ var requestCounter uint64
 var activeRequests int64
 
 // getNextServer는 라운드 로빈 방식으로 다음 호출할 서버의 URL을 반환합니다.
+// [추가] 경로별 누적 요청 수를 추적할 카운터 (Grafana 대시보드용)
+var chatRequests uint64
+var summarizeRequests uint64
+
 func getNextServer() string {
 	// atomic을 사용하여 동시성(Goroutine) 환경에서 안전하게 인덱스 증가
 	nextIndex := atomic.AddUint64(&requestCounter, 1)
@@ -33,6 +37,13 @@ func loadBalancerHandler(w http.ResponseWriter, r *http.Request) {
 	// [추가] 요청이 들어오면 활성 요청 수 1 증가, 끝나면(defer) 1 감소
 	atomic.AddInt64(&activeRequests, 1)
 	defer atomic.AddInt64(&activeRequests, -1)
+
+	// [추가] URL 경로별로 트래픽 누적 카운트 증가
+	if r.URL.Path == "/api/chat" {
+		atomic.AddUint64(&chatRequests, 1)
+	} else if r.URL.Path == "/api/summarize" {
+		atomic.AddUint64(&summarizeRequests, 1)
+	}
 
 	targetURL := getNextServer()
 	parsedURL, _ := url.Parse(targetURL)
@@ -52,9 +63,22 @@ func loadBalancerHandler(w http.ResponseWriter, r *http.Request) {
 // [추가] Operator가 주기적으로 찔러볼 메트릭 엔드포인트
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	currentActive := atomic.LoadInt64(&activeRequests)
-	w.Header().Set("Content-Type", "application/json")
-	// 현재 라우터가 머금고 있는 활성 요청 수를 JSON으로 변환
-	fmt.Fprint(w, `{"active_requests": %d}`, currentActive)
+	chatTotal := atomic.LoadUint64(&chatRequests)
+	summarizeTotal := atomic.LoadUint64(&summarizeRequests)
+
+	// [핵심] Prometheus가 긁어갈 수 있는 Plain Text 포맷으로 헤더 및 내용 출력
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+
+	// 1. 활성 요청 수 게이지 (Gauge)
+	fmt.Fprintf(w, "# HELP active_requests Number of currently active requests\n")
+	fmt.Fprintf(w, "# TYPE active_requests gauge\n")
+	fmt.Fprintf(w, "active_requests %d\n", currentActive)
+
+	// 2. 총 요청 수 카운터 (Counter) - 어제 Grafana에서 쿼리했던 바로 그 이름!
+	fmt.Fprintf(w, "# HELP http_requests_total Total number of HTTP requests\n")
+	fmt.Fprintf(w, "# TYPE http_requests_total counter\n")
+	fmt.Fprintf(w, "http_requests_total{path=\"/api/chat\"} %d\n", chatTotal)
+	fmt.Fprintf(w, "http_requests_total{path=\"/api/summarize\"} %d\n", summarizeTotal)
 }
 
 func main() {
