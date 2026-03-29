@@ -18,7 +18,10 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
+	"io"
+	"strings"
+
+	// "encoding/json"
 	"fmt"
 	"math"
 	"net/http"
@@ -76,10 +79,21 @@ func (r *ModelAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	defer resp.Body.Close()
 
 	var metrics struct {
-		ActiveRequests int `json:"active_requests"`
+		ActiveRequests int
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&metrics); err != nil {
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Error(err, "메트릭 응답을 읽지 못했습니다.")
 		return ctrl.Result{RequeueAfter: time.Second * 5}, nil
+	}
+
+	lines := strings.Split(string(bodyBytes), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "active_requests ") {
+			fmt.Sscanf(line, "active_requests %d", &metrics.ActiveRequests)
+			break
+		}
 	}
 
 	// 3. 타겟 Deployment(Python AI 모델) 가져오기
@@ -90,6 +104,12 @@ func (r *ModelAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// 4. 오토스케일링 수학 로직 (필요한 파드 수 계산)
+
+	// 0 으로 나누기 방지 (안전 장치)
+	if autoscaler.Spec.TargetRequestsPerPod == 0 {
+		autoscaler.Spec.TargetRequestsPerPod = 1
+	}
+
 	var currentReplicas int32 = 0
 	if deploy.Spec.Replicas != nil {
 		currentReplicas = *deploy.Spec.Replicas
