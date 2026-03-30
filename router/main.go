@@ -7,6 +7,9 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sync/atomic"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // 서빙을 담당할 백엔드(Python 더미 AI) 서버들의 주소
@@ -18,11 +21,11 @@ var backendServers = []string{
 // 스레드 세이프(Thread-safe)한 라운드 로빈 카운터
 var requestCounter uint64
 
-// [추가] 현재 처리 중인(In-flight) 활성 요청 수를 추적하기 위한 변수
+// 현재 처리 중인(In-flight) 활성 요청 수
 var activeRequests int64
 
 // getNextServer는 라운드 로빈 방식으로 다음 호출할 서버의 URL을 반환합니다.
-// [추가] 경로별 누적 요청 수를 추적할 카운터 (Grafana 대시보드용)
+// 경로별 누적 요청 수를 추적할 카운터 (Grafana 대시보드용)
 var chatRequests uint64
 var summarizeRequests uint64
 
@@ -48,7 +51,23 @@ func loadBalancerHandler(w http.ResponseWriter, r *http.Request) {
 	targetURL := getNextServer()
 	parsedURL, _ := url.Parse(targetURL)
 
-	fmt.Printf("[Go Router] 트래픽 포워딩 ➡️ %s (경로: %s)\n", targetURL, r.URL.Path)
+	// --- [Tracing 핵심 구간] ---
+	// 1. 헤더 추출
+	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+
+	// 2. 새로운 Span & Context 생성
+	tracer := otel.Tracer("go-router")
+	newCtx, span := tracer.Start(ctx, "Go Router Forwarding")
+	defer span.End()
+
+	// 3. Request 객체의 Context 교체
+	r = r.WithContext(newCtx)
+
+	// 4. 교체된 Context를 바탕으로 대상 서버에 보낼 헤더(traceparent) 덮어쓰기
+	otel.GetTextMapPropagator().Inject(newCtx, propagation.HeaderCarrier(r.Header))
+
+	fmt.Printf("[Go Router] 트래픽 포워딩 ➡️ %s (경로: %s) | TraceID: %s\n", targetURL, r.URL.Path, span.SpanContext().TraceID().String())
+	// ---------------------------
 
 	// Go의 내장 리버스 프록시 객체 생성
 	proxy := httputil.NewSingleHostReverseProxy(parsedURL)
@@ -60,7 +79,7 @@ func loadBalancerHandler(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
-// [추가] Operator가 주기적으로 찔러볼 메트릭 엔드포인트
+// Prometheus 메트릭 엔드포인트
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	currentActive := atomic.LoadInt64(&activeRequests)
 	chatTotal := atomic.LoadUint64(&chatRequests)
@@ -83,6 +102,10 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	// 특정 엔드포인트(또는 루트 "/")를 로드밸런서에 매핑
+	// W3C Trace Context 전파 설정 (OpenTelemetry 필수)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	// 라우팅 등록
 	http.HandleFunc("/api/summarize", loadBalancerHandler)
 	http.HandleFunc("/api/chat", loadBalancerHandler)
 	// [추가] 메트릭 라우팅 등록
