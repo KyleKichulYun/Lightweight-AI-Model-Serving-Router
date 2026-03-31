@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: go-router-monitor
+  namespace: monitoring # Prometheus가 설치된 네임스페이스에 맞게 조정 (보통 monitoring 또는 observability)
+  labels:
+    # Prometheus 오퍼레이터가 이 모니터를 줍줍해 가도록 하는 필수 라벨입니다.
+    # kube-prometheus-stack 설치 시 기본값은 보통 release: prometheus 입니다.
+    release: prometheus 
+spec:
+  selector:
+    matchLabels:
+      # Go 라우터 파드를 묶어주는 Service의 라벨을 여기에 적습니다.
+      app: go-router 
+  endpoints:
+  - port: http-web # Go 라우터 Service에 정의된 포트 이름 (숫자가 아닌 '이름'이 들어가야 합니다. 예: http, http-web, metrics 등)
+    path: /metrics
+    interval: 5s # 5초마다 아주 촘촘하게 긁어옵니다. (오토스케일링 반응속도 최적화!)
