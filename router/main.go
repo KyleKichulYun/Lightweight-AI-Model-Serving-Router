@@ -7,9 +7,11 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sync/atomic"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace" // trace 패키지 누락된 부분 추가
 )
 
 // 서빙을 담당할 백엔드(Python 더미 AI) 서버들의 주소
@@ -28,6 +30,10 @@ var activeRequests int64
 // 경로별 누적 요청 수를 추적할 카운터 (Grafana 대시보드용)
 var chatRequests uint64
 var summarizeRequests uint64
+
+// TTFT 측정을 위한 전역 변수
+var ttftSumMs uint64 // TTFT 합계 (밀리초)
+var ttftCount uint64 // TTFT 측정 횟수
 
 func getNextServer() string {
 	// atomic을 사용하여 동시성(Goroutine) 환경에서 안전하게 인덱스 증가
@@ -75,8 +81,16 @@ func loadBalancerHandler(w http.ResponseWriter, r *http.Request) {
 	// 대상 서버가 호스트 기반 라우팅을 할 수 있도록 헤더 조작
 	r.Host = parsedURL.Host
 
-	// 프록시 실행 (요청 전달 및 응답 반환)
-	proxy.ServeHTTP(w, r)
+	// 🔥 [수정 1] 프록시 실행 시, 채팅 API라면 우리가 만든 TTFT 인터셉터로 감싸서 넘깁니다!
+	if r.URL.Path == "/api/chat" {
+		tw := &ttftResponseWriter{
+			ResponseWriter: w,
+			startTime:      time.Now(),
+		}
+		proxy.ServeHTTP(tw, r)
+	} else {
+		proxy.ServeHTTP(w, r)
+	}
 }
 
 // Prometheus 메트릭 엔드포인트
@@ -84,6 +98,10 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	currentActive := atomic.LoadInt64(&activeRequests)
 	chatTotal := atomic.LoadUint64(&chatRequests)
 	summarizeTotal := atomic.LoadUint64(&summarizeRequests)
+
+	// 🔥 [수정 2] 메모리에 저장된 TTFT 변수들 읽어오기
+	currentTtftSum := atomic.LoadUint64(&ttftSumMs)
+	currentTtftCount := atomic.LoadUint64(&ttftCount)
 
 	// [핵심] Prometheus가 긁어갈 수 있는 Plain Text 포맷으로 헤더 및 내용 출력
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
@@ -93,11 +111,46 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE active_requests gauge\n")
 	fmt.Fprintf(w, "active_requests %d\n", currentActive)
 
-	// 2. 총 요청 수 카운터 (Counter) - 어제 Grafana에서 쿼리했던 바로 그 이름!
+	// 2. 총 요청 수 카운터 (Counter)
 	fmt.Fprintf(w, "# HELP http_requests_total Total number of HTTP requests\n")
 	fmt.Fprintf(w, "# TYPE http_requests_total counter\n")
 	fmt.Fprintf(w, "http_requests_total{path=\"/api/chat\"} %d\n", chatTotal)
 	fmt.Fprintf(w, "http_requests_total{path=\"/api/summarize\"} %d\n", summarizeTotal)
+
+	// 🔥 [수정 2] Prometheus가 긁어갈 수 있도록 텍스트로 출력
+	fmt.Fprintf(w, "# HELP ai_ttft_sum_milliseconds Total sum of Time To First Token in ms\n")
+	fmt.Fprintf(w, "# TYPE ai_ttft_sum_milliseconds counter\n")
+	fmt.Fprintf(w, "ai_ttft_sum_milliseconds %d\n", currentTtftSum)
+
+	fmt.Fprintf(w, "# HELP ai_ttft_count Total number of TTFT measurements\n")
+	fmt.Fprintf(w, "# TYPE ai_ttft_count counter\n")
+	fmt.Fprintf(w, "ai_ttft_count %d\n", currentTtftCount)
+}
+
+// ttftResponseWriter는 프록시 응답을 가로채서 첫 토큰 도달 시간을 잽니다.
+type ttftResponseWriter struct {
+	http.ResponseWriter
+	startTime  time.Time
+	firstToken bool
+}
+
+func (w *ttftResponseWriter) Write(b []byte) (int, error) {
+	if !w.firstToken {
+		w.firstToken = true
+		ttft := time.Since(w.startTime).Milliseconds()
+
+		fmt.Printf("⏱️ [TTFT 측정] 첫 토큰 도달 시간: %d ms\n", ttft)
+
+		atomic.AddUint64(&ttftSumMs, uint64(ttft))
+		atomic.AddUint64(&ttftCount, 1)
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *ttftResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func main() {
