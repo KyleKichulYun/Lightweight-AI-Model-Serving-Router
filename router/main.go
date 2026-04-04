@@ -1,17 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/trace" // trace 패키지 누락된 부분 추가
 )
 
 // 서빙을 담당할 백엔드(Python 더미 AI) 서버들의 주소
@@ -35,6 +37,7 @@ var summarizeRequests uint64
 var ttftSumMs uint64 // TTFT 합계 (밀리초)
 var ttftCount uint64 // TTFT 측정 횟수
 
+// getNextServer는 라운드 로빈 방식으로 다음 호출할 서버의 URL을 반환합니다.
 func getNextServer() string {
 	// atomic을 사용하여 동시성(Goroutine) 환경에서 안전하게 인덱스 증가
 	nextIndex := atomic.AddUint64(&requestCounter, 1)
@@ -81,7 +84,7 @@ func loadBalancerHandler(w http.ResponseWriter, r *http.Request) {
 	// 대상 서버가 호스트 기반 라우팅을 할 수 있도록 헤더 조작
 	r.Host = parsedURL.Host
 
-	// 🔥 [수정 1] 프록시 실행 시, 채팅 API라면 우리가 만든 TTFT 인터셉터로 감싸서 넘깁니다!
+	// 채팅 API라면 TTFT 인터셉터로 감싸서 응답 시간을 측정합니다.
 	if r.URL.Path == "/api/chat" {
 		tw := &ttftResponseWriter{
 			ResponseWriter: w,
@@ -94,7 +97,7 @@ func loadBalancerHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // Prometheus 메트릭 엔드포인트
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
+func metricsHandler(w http.ResponseWriter, _ *http.Request) {
 	currentActive := atomic.LoadInt64(&activeRequests)
 	chatTotal := atomic.LoadUint64(&chatRequests)
 	summarizeTotal := atomic.LoadUint64(&summarizeRequests)
@@ -107,24 +110,24 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 
 	// 1. 활성 요청 수 게이지 (Gauge)
-	fmt.Fprintf(w, "# HELP active_requests Number of currently active requests\n")
-	fmt.Fprintf(w, "# TYPE active_requests gauge\n")
-	fmt.Fprintf(w, "active_requests %d\n", currentActive)
+	_, _ = fmt.Fprintf(w, "# HELP active_requests Number of currently active requests\n")
+	_, _ = fmt.Fprintf(w, "# TYPE active_requests gauge\n")
+	_, _ = fmt.Fprintf(w, "active_requests %d\n", currentActive)
 
 	// 2. 총 요청 수 카운터 (Counter)
-	fmt.Fprintf(w, "# HELP http_requests_total Total number of HTTP requests\n")
-	fmt.Fprintf(w, "# TYPE http_requests_total counter\n")
-	fmt.Fprintf(w, "http_requests_total{path=\"/api/chat\"} %d\n", chatTotal)
-	fmt.Fprintf(w, "http_requests_total{path=\"/api/summarize\"} %d\n", summarizeTotal)
+	_, _ = fmt.Fprintf(w, "# HELP http_requests_total Total number of HTTP requests\n")
+	_, _ = fmt.Fprintf(w, "# TYPE http_requests_total counter\n")
+	_, _ = fmt.Fprintf(w, "http_requests_total{path=\"/api/chat\"} %d\n", chatTotal)
+	_, _ = fmt.Fprintf(w, "http_requests_total{path=\"/api/summarize\"} %d\n", summarizeTotal)
 
-	// 🔥 [수정 2] Prometheus가 긁어갈 수 있도록 텍스트로 출력
-	fmt.Fprintf(w, "# HELP ai_ttft_sum_milliseconds Total sum of Time To First Token in ms\n")
-	fmt.Fprintf(w, "# TYPE ai_ttft_sum_milliseconds counter\n")
-	fmt.Fprintf(w, "ai_ttft_sum_milliseconds %d\n", currentTtftSum)
+	// 🔥 Prometheus가 긁어갈 수 있도록 텍스트로 출력
+	_, _ = fmt.Fprintf(w, "# HELP ai_ttft_sum_milliseconds Total sum of Time To First Token in ms\n")
+	_, _ = fmt.Fprintf(w, "# TYPE ai_ttft_sum_milliseconds counter\n")
+	_, _ = fmt.Fprintf(w, "ai_ttft_sum_milliseconds %d\n", currentTtftSum)
 
-	fmt.Fprintf(w, "# HELP ai_ttft_count Total number of TTFT measurements\n")
-	fmt.Fprintf(w, "# TYPE ai_ttft_count counter\n")
-	fmt.Fprintf(w, "ai_ttft_count %d\n", currentTtftCount)
+	_, _ = fmt.Fprintf(w, "# HELP ai_ttft_count Total number of TTFT measurements\n")
+	_, _ = fmt.Fprintf(w, "# TYPE ai_ttft_count counter\n")
+	_, _ = fmt.Fprintf(w, "ai_ttft_count %d\n", currentTtftCount)
 }
 
 // ttftResponseWriter는 프록시 응답을 가로채서 첫 토큰 도달 시간을 잽니다.
@@ -153,15 +156,52 @@ func (w *ttftResponseWriter) Flush() {
 	}
 }
 
+// guardrailMiddleware는 들어오는 요청의 Body를 검사하여 위험 프롬프트를 차단합니다.
+func guardrailMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 채팅 API이고 POST 요청일 때만 검사
+		if r.URL.Path == "/api/chat" && r.Method == http.MethodPost {
+			// 1. Request Body 읽기
+			bodyBytes, err := io.ReadAll(r.Body)
+			if err == nil {
+				// 원본 데이터를 다시 읽을 수 있도록 Body 복구
+				r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+				bodyString := string(bodyBytes)
+
+				// 2. 금지어 (테스트용)
+				forbiddenWords := []string{
+					"바보",
+				}
+
+				// 3. 검사 및 차단
+				for _, word := range forbiddenWords {
+					if strings.Contains(strings.ToLower(bodyString), word) {
+						fmt.Printf("🛡️ [Guardrail] 위험 키워드 감지 및 차단: '%s'\n", word)
+
+						w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusUnauthorized)
+						_, _ = w.Write([]byte(`{"error": "401 Unauthorized: Guardrail에 의해 차단되었습니다."}`))
+						return
+					}
+				}
+			}
+		}
+		// 안전한 요청이면 원래 라우터 핸들러 실행
+		next(w, r)
+	}
+}
+
 func main() {
-	// 특정 엔드포인트(또는 루트 "/")를 로드밸런서에 매핑
 	// W3C Trace Context 전파 설정 (OpenTelemetry 필수)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
 	// 라우팅 등록
 	http.HandleFunc("/api/summarize", loadBalancerHandler)
-	http.HandleFunc("/api/chat", loadBalancerHandler)
-	// [추가] 메트릭 라우팅 등록
+
+	// 채팅 API에 Guardrail 미들웨어 적용
+	http.HandleFunc("/api/chat", guardrailMiddleware(loadBalancerHandler))
+
 	http.HandleFunc("/metrics", metricsHandler)
 
 	port := ":8080"
