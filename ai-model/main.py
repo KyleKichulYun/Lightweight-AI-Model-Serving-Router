@@ -3,6 +3,8 @@ import time
 import asyncio
 import logging
 import operator
+import networkx as nx
+
 from typing import TypedDict, Annotated, Sequence
 
 from fastapi import FastAPI, Request
@@ -27,9 +29,24 @@ LoggingInstrumentor().instrument(set_logging_format=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+SERVER_ID = os.getenv("SERVER_ID", "Unknown-Server")
+
+# ==========================================
+# 2. [GraphDB 메모리 로드]
+# ==========================================
+try:
+    hippufu_graph = nx.read_gml("hippufu_graph.gml")
+    logger.info(f"[{SERVER_ID}] 🕸️ 지식 그래프 로드 완료! (노드: {hippufu_graph.number_of_nodes()}개)")
+except Exception as e:
+    logger.warning(f"[{SERVER_ID}] ⚠️ 그래프 파일을 찾을 수 없습니다. (먼저 indexer.py를 실행하세요): {e}")
+    hippufu_graph = nx.DiGraph()
+
+# ==========================================
+# 3. FastAPI 앱 생성 및 나머지 코드...
+# ==========================================
 app = FastAPI(title="Hippufu Persona AI Server with GraphRAG")
 
-# 2. FastAPI 앱에 OTel 미들웨어 부착 (traceparent 헤더 자동 파싱)
+# FastAPI 앱에 OTel 미들웨어 부착 (traceparent 헤더 자동 파싱)
 FastAPIInstrumentor.instrument_app(app)
 
 # ==========================================
@@ -77,10 +94,33 @@ async def analyze_intent_node(state: GraphState):
     return {"intent": intent}
 
 async def local_search_node(state: GraphState):
-    """특정 엔티티 중심의 검색 모방 (GraphDB 역할)"""
-    mock_data = "조조와 유비는 삼국지에서 가장 유명한 라이벌 관계입니다."
-    logger.info(f"[{SERVER_ID}] 🔍 Local Search (Graph 탐색) 완료")
-    return {"context": f"[GraphDB 검색 결과] {mock_data}"}
+    """특정 엔티티 중심의 검색 (GraphDB 실제 연동)"""
+    user_message = state["messages"][-1].content
+    logger.info(f"[{SERVER_ID}] 🔍 Local Search (Graph 탐색) 시작")
+
+    found_context = []
+
+    # PoC용 초간단 룰베이스 엔티티 매칭
+    # (실무에서는 이 부분도 LLM/NER 모델로 엔티티를 뽑아내서 검색합니다)
+    for node in hippufu_graph.nodes:
+        if node in user_message:
+            # 질문에 포함된 엔티티가 그래프에 있다면, 해당 엔티티와 연결된(1-depth) 모든 관계를 싹 긁어옵니다.
+            # 1. 정방향 엣지 (내가 향하는 관계)
+            for source, target, data in hippufu_graph.edges(node, data=True):
+                found_context.append(f"{source}는(은) {target}에 대해 '{data['relation']}' 관계입니다.")
+
+            # 2. 역방향 엣지 (나를 향하는 관계)
+            for source, target, data in hippufu_graph.in_edges(node, data=True):
+                found_context.append(f"{source}는(은) {target}에 대해 '{data['relation']}' 관계입니다.")
+
+    if not found_context:
+        context_str = "관련된 그래프 지식이 없습니다."
+    else:
+        # 중복 제거 후 문자열 조합
+        context_str = "\n".join(list(set(found_context)))
+
+    logger.info(f"[{SERVER_ID}] 🔍 추출된 Graph 문맥: {context_str}")
+    return {"context": f"[GraphDB 검색 결과]\n{context_str}"}
 
 async def global_search_node(state: GraphState):
     """전체 문맥 기반의 검색 모방 (VectorDB 역할)"""
