@@ -41,6 +41,20 @@ except Exception as e:
     logger.warning(f"[{SERVER_ID}] ⚠️ 그래프 파일을 찾을 수 없습니다. (먼저 indexer.py를 실행하세요): {e}")
     hippufu_graph = nx.DiGraph()
 
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
+
+# ==========================================
+# [VectorDB (FAISS) 메모리 로드]
+# ==========================================
+try:
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    hippufu_faiss = FAISS.load_local("hippufu_faiss_index", embeddings, allow_dangerous_deserialization=True)
+    logger.info(f"[{SERVER_ID}] 🗂️ FAISS Vector DB (Global 요약본) 로드 완료!")
+except Exception as e:
+    logger.warning(f"[{SERVER_ID}] ⚠️ FAISS 인덱스를 찾을 수 없습니다: {e}")
+    hippufu_faiss = None
+
 # ==========================================
 # 3. FastAPI 앱 생성 및 나머지 코드...
 # ==========================================
@@ -123,10 +137,20 @@ async def local_search_node(state: GraphState):
     return {"context": f"[GraphDB 검색 결과]\n{context_str}"}
 
 async def global_search_node(state: GraphState):
-    """전체 문맥 기반의 검색 모방 (VectorDB 역할)"""
-    mock_data = "삼국지는 한나라 말기 위, 촉, 오 세 나라가 천하를 두고 다투는 방대한 역사 이야기입니다."
-    logger.info(f"[{SERVER_ID}] 🌐 Global Search (Community 요약 검색) 완료")
-    return {"context": f"[VectorDB 요약 결과] {mock_data}"}
+    """전체 문맥 기반의 검색 (VectorDB 실제 연동)"""
+    user_message = state["messages"][-1].content
+    logger.info(f"[{SERVER_ID}] 🌐 Global Search (Vector 탐색) 시작")
+
+    if hippufu_faiss is None:
+        return {"context": "[VectorDB 검색 실패] 인덱스가 없습니다."}
+
+    # 유저의 질문과 가장 유사한 커뮤니티 요약본 2개를 가져옵니다.
+    docs = hippufu_faiss.similarity_search(user_message, k=2)
+
+    context_str = "\n\n".join([f"[커뮤니티 {doc.metadata.get('community_id')} 요약]\n{doc.page_content}" for doc in docs])
+
+    logger.info(f"[{SERVER_ID}] 🌐 추출된 Vector 문맥: {context_str}")
+    return {"context": f"[VectorDB 전체 요약 검색 결과]\n{context_str}"}
 
 def route_by_intent(state: GraphState):
     return "local_search" if state["intent"] == "local" else "global_search"
