@@ -18,8 +18,9 @@ import (
 
 // 서빙을 담당할 백엔드(Python 더미 AI) 서버들의 주소
 var backendServers = []string{
+	"http://localhost:80",
 	// K8s 내부에서는 Service 이름이 곧 도메인이 됩니다.
-	"http://dummy-ai-model-svc:80",
+	//"http://dummy-ai-model-svc:80",
 }
 
 // 스레드 세이프(Thread-safe)한 라운드 로빈 카운터
