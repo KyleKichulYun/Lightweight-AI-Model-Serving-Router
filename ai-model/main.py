@@ -9,22 +9,25 @@ from typing import TypedDict, Annotated, Sequence
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field # Field 임포트 추가
 
 # OpenTelemetry 패키지
 from opentelemetry import trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.logging import LoggingInstrumentor
 
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings # Embeddings 임포트 추가
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_community.vectorstores import FAISS # FAISS 임포트 추가
 
 # LangGraph 패키지
 from langgraph.graph import StateGraph, END
 
-# 1. 로깅 포맷에 TraceID 자동 주입
+# ==========================================
+# 1. 로깅 및 서버 ID 초기화
+# ==========================================
 LoggingInstrumentor().instrument(set_logging_format=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,31 +35,25 @@ logger = logging.getLogger(__name__)
 SERVER_ID = os.getenv("SERVER_ID", "Unknown-Server")
 
 # ==========================================
-# 2. [GraphDB 메모리 로드]
+# 2. [GraphDB 및 VectorDB 메모리 로드]
 # ==========================================
 try:
     hippufu_graph = nx.read_gml("hippufu_graph.gml")
     logger.info(f"[{SERVER_ID}] 🕸️ 지식 그래프 로드 완료! (노드: {hippufu_graph.number_of_nodes()}개)")
 except Exception as e:
-    logger.warning(f"[{SERVER_ID}] ⚠️ 그래프 파일을 찾을 수 없습니다. (먼저 indexer.py를 실행하세요): {e}")
+    logger.warning(f"[{SERVER_ID}] ⚠️ 그래프 파일을 찾을 수 없습니다: {e}")
     hippufu_graph = nx.DiGraph()
 
-from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings
-
-# ==========================================
-# [VectorDB (FAISS) 메모리 로드]
-# ==========================================
 try:
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
     hippufu_faiss = FAISS.load_local("hippufu_faiss_index", embeddings, allow_dangerous_deserialization=True)
-    logger.info(f"[{SERVER_ID}] 🗂️ FAISS Vector DB (Global 요약본) 로드 완료!")
+    logger.info(f"[{SERVER_ID}] 🗂️ FAISS Vector DB 로드 완료!")
 except Exception as e:
     logger.warning(f"[{SERVER_ID}] ⚠️ FAISS 인덱스를 찾을 수 없습니다: {e}")
     hippufu_faiss = None
 
 # ==========================================
-# 3. FastAPI 앱 생성 및 나머지 코드...
+# 3. FastAPI 앱 생성 및 OTel 부착
 # ==========================================
 app = FastAPI(title="Hippufu Persona AI Server with GraphRAG")
 
@@ -64,7 +61,7 @@ app = FastAPI(title="Hippufu Persona AI Server with GraphRAG")
 FastAPIInstrumentor.instrument_app(app)
 
 # ==========================================
-# [LangChain LLM & 프롬프트 세팅]
+# 4. [LangChain LLM & 프롬프트 세팅]
 # ==========================================
 system_prompt = """
 너의 이름은 '히뿌푸'야. 배에 푹신한 구름 무늬가 있는 귀엽고 다정한 하마지.
@@ -80,38 +77,41 @@ prompt = ChatPromptTemplate.from_messages([
     ("human", "{user_input}")
 ])
 
-llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0.7,
-    streaming=True
-)
-
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, streaming=True)
 chain = prompt | llm | StrOutputParser()
 
-# 라우터가 어떤 컨테이너로 트래픽을 보냈는지 확인하기 위한 환경변수
-SERVER_ID = os.getenv("SERVER_ID", "Unknown-Server")
-
 # ==========================================
-# [GraphRAG PoC: LangGraph 상태 및 노드 정의]
+# 5. [GraphRAG: LangGraph 상태 및 라우팅 로직]
 # ==========================================
 class GraphState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
-    intent: str      # 'local' or 'global'
-    context: str     # 검색된 데이터 문맥
+    intent: str      # 'local', 'global', 'hybrid'
+    context: str
+
+# 의도 분류를 위한 Pydantic 스키마
+class IntentClassification(BaseModel):
+    intent: str = Field(description="질문의 의도. 특정 인물/사물의 사실과 관계면 'local', 전체 스토리나 요약/맥락이면 'global', 둘 다 섞여 있거나 애매하면 'hybrid'로 분류.")
 
 async def analyze_intent_node(state: GraphState):
-    """질문의 의도를 분석하는 노드"""
-    last_message = state["messages"][-1].content
-    # PoC용 하드코딩: '전체'나 '요약'이 들어가면 Global, 아니면 Local
-    intent = "global" if "전체" in last_message or "요약" in last_message else "local"
-    logger.info(f"[{SERVER_ID}] 🧠 의도 분석 결과: {intent.upper()} Search 실행")
+    """LLM을 이용한 지능형 의도 분석 라우터"""
+    user_message = state["messages"][-1].content
+    logger.info(f"[{SERVER_ID}] 🧠 의도 분석 LLM 가동 중...")
+
+    classifier_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0).with_structured_output(IntentClassification)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "너는 질문의 의도를 분석하는 최고 수준의 검색 라우터야."),
+        ("human", "{question}")
+    ])
+
+    result = await classifier_llm.ainvoke(prompt.format_messages(question=user_message))
+    intent = result.intent
+
+    logger.info(f"[{SERVER_ID}] 🎯 판별된 의도: {intent.upper()} Search")
     return {"intent": intent}
 
 async def local_search_node(state: GraphState):
-    """특정 엔티티 중심의 검색 (GraphDB 실제 연동)"""
+    """GraphDB 탐색"""
     user_message = state["messages"][-1].content
-    logger.info(f"[{SERVER_ID}] 🔍 Local Search (Graph 탐색) 시작")
-
     found_context = []
 
     # PoC용 초간단 룰베이스 엔티티 매칭
@@ -127,20 +127,12 @@ async def local_search_node(state: GraphState):
             for source, target, data in hippufu_graph.in_edges(node, data=True):
                 found_context.append(f"{source}는(은) {target}에 대해 '{data['relation']}' 관계입니다.")
 
-    if not found_context:
-        context_str = "관련된 그래프 지식이 없습니다."
-    else:
-        # 중복 제거 후 문자열 조합
-        context_str = "\n".join(list(set(found_context)))
-
-    logger.info(f"[{SERVER_ID}] 🔍 추출된 Graph 문맥: {context_str}")
+    context_str = "\n".join(list(set(found_context))) if found_context else "관련된 그래프 지식이 없습니다."
     return {"context": f"[GraphDB 검색 결과]\n{context_str}"}
 
 async def global_search_node(state: GraphState):
-    """전체 문맥 기반의 검색 (VectorDB 실제 연동)"""
+    """VectorDB 탐색"""
     user_message = state["messages"][-1].content
-    logger.info(f"[{SERVER_ID}] 🌐 Global Search (Vector 탐색) 시작")
-
     if hippufu_faiss is None:
         return {"context": "[VectorDB 검색 실패] 인덱스가 없습니다."}
 
@@ -152,24 +144,42 @@ async def global_search_node(state: GraphState):
     logger.info(f"[{SERVER_ID}] 🌐 추출된 Vector 문맥: {context_str}")
     return {"context": f"[VectorDB 전체 요약 검색 결과]\n{context_str}"}
 
-def route_by_intent(state: GraphState):
-    return "local_search" if state["intent"] == "local" else "global_search"
+async def hybrid_search_node(state: GraphState):
+    """GraphDB와 VectorDB를 동시에 찌르는 하이브리드 탐색"""
+    logger.info(f"[{SERVER_ID}] 🧬 Hybrid Search (Graph + Vector 동시 탐색) 시작")
+    local_result, global_result = await asyncio.gather(
+        local_search_node(state),
+        global_search_node(state)
+    )
+    combined_context = f"{local_result['context']}\n\n{global_result['context']}"
+    logger.info(f"[{SERVER_ID}] 🧬 Hybrid Search 완료!")
+    return {"context": combined_context}
 
-# LangGraph 조립
+def route_by_intent(state: GraphState):
+    intent = state["intent"]
+    if intent == "local": return "local_search"
+    elif intent == "global": return "global_search"
+    else: return "hybrid_search"
+
+# ==========================================
+# 6. [LangGraph 조립]
+# ==========================================
 workflow = StateGraph(GraphState)
 workflow.add_node("intent_analyzer", analyze_intent_node)
 workflow.add_node("local_search", local_search_node)
 workflow.add_node("global_search", global_search_node)
+workflow.add_node("hybrid_search", hybrid_search_node)
 
 workflow.set_entry_point("intent_analyzer")
 workflow.add_conditional_edges("intent_analyzer", route_by_intent)
 workflow.add_edge("local_search", END)
 workflow.add_edge("global_search", END)
+workflow.add_edge("hybrid_search", END)
 
 graph_app = workflow.compile()
 
 # ==========================================
-# [FastAPI 엔드포인트]
+# 7. [FastAPI 엔드포인트]
 # ==========================================
 class ChatRequest(BaseModel):
     text: str  # Go 라우터에서 보내는 JSON key와 맞춤
