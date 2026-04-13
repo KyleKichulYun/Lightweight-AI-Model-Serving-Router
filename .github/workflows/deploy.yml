@@ -44,8 +44,8 @@ jobs:
           context: ./router
           push: ${{ github.event_name != 'pull_request' }} # PR일 때는 Push 생략
           tags: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/kyle-go-router:latest
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/kyle-go-router:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.REPO_OWNER }}/kyle-go-router:latest
+            ${{ env.REGISTRY }}/${{ env.REPO_OWNER }}/kyle-go-router:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -78,7 +78,7 @@ jobs:
           context: ./ai-model
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/kyle-ai-server:latest
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/kyle-ai-server:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.REPO_OWNER }}/kyle-ai-server:latest
+            ${{ env.REGISTRY }}/${{ env.REPO_OWNER }}/kyle-ai-server:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
