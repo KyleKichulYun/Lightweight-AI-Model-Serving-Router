@@ -72,6 +72,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # 🟢 [핵심] 이 변수 생성 스텝이 빌드(Build and push) 직전에 반드시 있어야 합니다!
+      - name: Set lower case repository owner
+        run: |
+          echo "REPO_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
+
       - name: Build and push Python AI Server
         uses: docker/build-push-action@v5
         with:
