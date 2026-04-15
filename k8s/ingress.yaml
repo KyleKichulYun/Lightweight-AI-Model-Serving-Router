@@ -1,0 +1,30 @@
+# k8s/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-router-ingress
+  namespace: default
+  annotations:
+    # 🎯 [기존 유지] AI 프롬프트 페이로드가 커질 것을 대비한 넉넉한 바디 사이즈!
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    # 🔒 [신규 추가] cert-manager에게 'selfsigned-issuer' 발급기를 쓰라고 지시합니다.
+    cert-manager.io/cluster-issuer: "selfsigned-issuer"
+spec:
+  # 🎯 [최신 표준] 기존 kubernetes.io/ingress.class 어노테이션 대신 spec에 명시하는 것이 K8s 1.18+ 권장 사항입니다.
+  ingressClassName: nginx
+  # 🔒 [신규 추가] api.kyles-ai.local 도메인에 대한 TLS(HTTPS) 인증서를 요청합니다.
+  tls:
+  - hosts:
+    - api.kyles-ai.local
+    secretName: ai-router-tls-secret # cert-manager가 이 이름으로 비밀번호 상자(Secret)를 만들어 인증서를 담아줍니다.
+  rules:
+  - host: api.kyles-ai.local   # 👈 우리가 사용할 로컬 전용 멋진 도메인!
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: go-router-svc  # 👈 도메인으로 들어오면 Go 라우터(포트 80)로 토스!
+            port:
+              number: 80 # 🎯 [기존 유지] 기존에 설정하신 Go 라우터 포트 그대로!

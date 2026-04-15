@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dummy-ai-model
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: dummy-ai-model
+  template:
+    metadata:
+      labels:
+        app: dummy-ai-model
+    spec:
+      containers:
+      - name: dummy-ai-model
+        image: dummy-ai-model:latest
+        imagePullPolicy: Never # 로컬 이미지를 사용하도록 강제
+        ports:
+        - containerPort: 8000
+        env:
+        - name: SERVER_ID
+          # Pod의 고유 이름을 SERVER_ID 환경변수로 주입
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name 
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ai-secrets
+              key: OPENAI_API_KEY
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dummy-ai-model-svc
+spec:
+  selector:
+    app: dummy-ai-model
+  ports:
+  - protocol: TCP
+    port: 80         # K8s 내부에서 접근할 포트
+    targetPort: 8000 # Python FastAPI 컨테이너 포트

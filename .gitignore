@@ -28,5 +28,14 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+
+# =========================
+# Python & AI Model
+# =========================
+venv/
+__pycache__/
+*.pyc
+*.iml
+/ai-model/*.png
