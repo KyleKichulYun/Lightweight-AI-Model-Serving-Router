@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -16,90 +18,104 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 )
 
-// 서빙을 담당할 백엔드(Python 더미 AI) 서버들의 주소
-var backendServers = []string{
-	"http://localhost:80",
-	// K8s 내부에서는 Service 이름이 곧 도메인이 됩니다.
-	//"http://dummy-ai-model-svc:80",
+// 전역 변수 설정
+var (
+	backendServers  = []string{"http://localhost:80"}
+	requestCounter  uint64
+	chatRequests    uint64
+	summarizeRequests uint64
+	ttftSumMs       uint64
+	ttftCount       uint64
+
+	// Backpressure용 세마포어 (최대 동시성 100으로 가정)
+	semaphore = make(chan struct{}, 100)
+
+	// 전역 Transport (커넥션 풀링 핵심)
+	sharedTransport = &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          1000,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+
+	proxies = make(map[string]*httputil.ReverseProxy)
+)
+
+func init() {
+	for _, addr := range backendServers {
+		target, _ := url.Parse(addr)
+		p := httputil.NewSingleHostReverseProxy(target)
+		p.Transport = sharedTransport
+		proxies[addr] = p
+	}
 }
 
-// 스레드 세이프(Thread-safe)한 라운드 로빈 카운터
-var requestCounter uint64
-
-// 현재 처리 중인(In-flight) 활성 요청 수
-var activeRequests int64
-
-// getNextServer는 라운드 로빈 방식으로 다음 호출할 서버의 URL을 반환합니다.
-// 경로별 누적 요청 수를 추적할 카운터 (Grafana 대시보드용)
-var chatRequests uint64
-var summarizeRequests uint64
-
-// TTFT 측정을 위한 전역 변수
-var ttftSumMs uint64 // TTFT 합계 (밀리초)
-var ttftCount uint64 // TTFT 측정 횟수
-
-// getNextServer는 라운드 로빈 방식으로 다음 호출할 서버의 URL을 반환합니다.
 func getNextServer() string {
-	// atomic을 사용하여 동시성(Goroutine) 환경에서 안전하게 인덱스 증가
 	nextIndex := atomic.AddUint64(&requestCounter, 1)
 	return backendServers[nextIndex%uint64(len(backendServers))]
 }
 
-// loadBalancerHandler는 들어오는 트래픽을 백엔드로 포워딩합니다.
 func loadBalancerHandler(w http.ResponseWriter, r *http.Request) {
-	// [추가] 요청이 들어오면 활성 요청 수 1 증가, 끝나면(defer) 1 감소
-	atomic.AddInt64(&activeRequests, 1)
-	defer atomic.AddInt64(&activeRequests, -1)
-
-	// [추가] URL 경로별로 트래픽 누적 카운트 증가
-	if r.URL.Path == "/api/chat" {
-		atomic.AddUint64(&chatRequests, 1)
-	} else if r.URL.Path == "/api/summarize" {
-		atomic.AddUint64(&summarizeRequests, 1)
+	// 1. Backpressure 제어
+	select {
+	case semaphore <- struct{}{}:
+		defer func() { <-semaphore }()
+	default:
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprintf(w, `{"error": "Too many requests (Backpressure active)"}`)
+		return
 	}
 
-	targetURL := getNextServer()
-	parsedURL, _ := url.Parse(targetURL)
+	// 2. 캐싱된 프록시 객체 획득
+	targetAddr := getNextServer()
+	proxy, ok := proxies[targetAddr]
+	if !ok {
+		http.Error(w, "Backend not found", http.StatusBadGateway)
+		return
+	}
 
-	// --- [Tracing 핵심 구간] ---
-	// 1. 헤더 추출
+	// 3. Tracing & Context 전파
 	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
-
-	// 2. 새로운 Span & Context 생성
 	tracer := otel.Tracer("go-router")
 	newCtx, span := tracer.Start(ctx, "Go Router Forwarding")
 	defer span.End()
 
-	// 3. Request 객체의 Context 교체
 	r = r.WithContext(newCtx)
-
-	// 4. 교체된 Context를 바탕으로 대상 서버에 보낼 헤더(traceparent) 덮어쓰기
 	otel.GetTextMapPropagator().Inject(newCtx, propagation.HeaderCarrier(r.Header))
 
-	fmt.Printf("[Go Router] 트래픽 포워딩 ➡️ %s (경로: %s) | TraceID: %s\n", targetURL, r.URL.Path, span.SpanContext().TraceID().String())
-	// ---------------------------
-
-	// Go의 내장 리버스 프록시 객체 생성
-	proxy := httputil.NewSingleHostReverseProxy(parsedURL)
-
-	// 대상 서버가 호스트 기반 라우팅을 할 수 있도록 헤더 조작
+	// 대상 서버 호스트 헤더 동기화
+	parsedURL, _ := url.Parse(targetAddr)
 	r.Host = parsedURL.Host
 
-	// 채팅 API라면 TTFT 인터셉터로 감싸서 응답 시간을 측정합니다.
+	fmt.Printf("[Go Router] ➡️ %s | Path: %s | TraceID: %s\n", targetAddr, r.URL.Path, span.SpanContext().TraceID().String())
+
+	// 4. 경로별 핸들링 및 실행 (단일 지점 실행 후 리턴)
 	if r.URL.Path == "/api/chat" {
+		atomic.AddUint64(&chatRequests, 1)
 		tw := &ttftResponseWriter{
 			ResponseWriter: w,
 			startTime:      time.Now(),
 		}
 		proxy.ServeHTTP(tw, r)
 	} else {
+		if r.URL.Path == "/api/summarize" {
+			atomic.AddUint64(&summarizeRequests, 1)
+		}
 		proxy.ServeHTTP(w, r)
 	}
 }
 
 // Prometheus 메트릭 엔드포인트
 func metricsHandler(w http.ResponseWriter, _ *http.Request) {
-	currentActive := atomic.LoadInt64(&activeRequests)
+	currentActive := len(semaphore)
 	chatTotal := atomic.LoadUint64(&chatRequests)
 	summarizeTotal := atomic.LoadUint64(&summarizeRequests)
 
@@ -202,7 +218,6 @@ func main() {
 
 	// 채팅 API에 Guardrail 미들웨어 적용
 	http.HandleFunc("/api/chat", guardrailMiddleware(loadBalancerHandler))
-
 	http.HandleFunc("/metrics", metricsHandler)
 
 	port := ":8080"
