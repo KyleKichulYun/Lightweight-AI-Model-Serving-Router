@@ -11,6 +11,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync" // [KYL-101] 추가
 	"sync/atomic"
 	"time"
 
@@ -18,14 +19,38 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 )
 
+// [KYL-101] 메모리 쥐어짜기: Zero-Copy 지향 버퍼 풀 설계
+var (
+	// 32KB 버퍼 풀. 포인터를 저장하여 인터페이스 박싱 비용 최소화
+	bytePool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 32*1024)
+			return &b
+		},
+	}
+)
+
+// ReverseProxy.BufferPool 인터페이스 구현
+type poolWrapper struct{}
+
+func (p *poolWrapper) Get() []byte {
+	return *bytePool.Get().(*[]byte)
+}
+
+func (p *poolWrapper) Put(b []byte) {
+	// 슬라이스 길이를 다시 용량만큼 늘려 리셋 후 반납
+	b = b[:cap(b)]
+	bytePool.Put(&b)
+}
+
 // 전역 변수 설정
 var (
-	backendServers  = []string{"http://localhost:80"}
-	requestCounter  uint64
-	chatRequests    uint64
+	backendServers    = []string{"http://localhost:80"}
+	requestCounter    uint64
+	chatRequests      uint64
 	summarizeRequests uint64
-	ttftSumMs       uint64
-	ttftCount       uint64
+	ttftSumMs         uint64
+	ttftCount         uint64
 
 	// Backpressure용 세마포어 (최대 동시성 100으로 가정)
 	semaphore = make(chan struct{}, 100)
@@ -53,6 +78,13 @@ func init() {
 		target, _ := url.Parse(addr)
 		p := httputil.NewSingleHostReverseProxy(target)
 		p.Transport = sharedTransport
+
+		// [KYL-101] 버퍼 풀 주입: 매 요청마다 발생하는 32KB 할당 제거
+		p.BufferPool = &poolWrapper{}
+
+		// 스트리밍 응답(SSE)의 지연 없는 중계를 위해 Flush Interval 설정
+		p.FlushInterval = 10 * time.Millisecond
+
 		proxies[addr] = p
 	}
 }
