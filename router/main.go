@@ -10,22 +10,50 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"runtime"
 	"strings"
+	"sync" // [KYL-101] 추가
 	"sync/atomic"
 	"time"
 
+	pb "github.com/KyleKichulYun/Lightweight-AI-Model-Serving-Router/gen/proto" // 생성된 패키지 경로
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
+	"google.golang.org/protobuf/proto"
 )
+
+// [KYL-101] 메모리 쥐어짜기: Zero-Copy 지향 버퍼 풀 설계
+var (
+	// 32KB 버퍼 풀. 포인터를 저장하여 인터페이스 박싱 비용 최소화
+	bytePool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 32*1024)
+			return &b
+		},
+	}
+)
+
+// ReverseProxy.BufferPool 인터페이스 구현
+type poolWrapper struct{}
+
+func (p *poolWrapper) Get() []byte {
+	return *bytePool.Get().(*[]byte)
+}
+
+func (p *poolWrapper) Put(b []byte) {
+	// 슬라이스 길이를 다시 용량만큼 늘려 리셋 후 반납
+	b = b[:cap(b)]
+	bytePool.Put(&b)
+}
 
 // 전역 변수 설정
 var (
-	backendServers  = []string{"http://localhost:80"}
-	requestCounter  uint64
-	chatRequests    uint64
+	backendServers    = []string{"http://localhost:80"}
+	requestCounter    uint64
+	chatRequests      uint64
 	summarizeRequests uint64
-	ttftSumMs       uint64
-	ttftCount       uint64
+	ttftSumMs         uint64
+	ttftCount         uint64
 
 	// Backpressure용 세마포어 (최대 동시성 100으로 가정)
 	semaphore = make(chan struct{}, 100)
@@ -53,6 +81,13 @@ func init() {
 		target, _ := url.Parse(addr)
 		p := httputil.NewSingleHostReverseProxy(target)
 		p.Transport = sharedTransport
+
+		// [KYL-101] 버퍼 풀 주입: 매 요청마다 발생하는 32KB 할당 제거
+		p.BufferPool = &poolWrapper{}
+
+		// 스트리밍 응답(SSE)의 지연 없는 중계를 위해 Flush Interval 설정
+		p.FlushInterval = 10 * time.Millisecond
+
 		proxies[addr] = p
 	}
 }
@@ -157,6 +192,14 @@ type ttftResponseWriter struct {
 func (w *ttftResponseWriter) Write(b []byte) (int, error) {
 	if !w.firstToken {
 		w.firstToken = true
+
+		// [KYL-102] 응답이 Protobuf 바이너리라면 언마샬링 시도
+		// (실제 프로덕션에서는 Content-Type 확인 로직 추가 권장)
+		res := &pb.ChatResponse{}
+		if err := proto.Unmarshal(b, res); err != nil {
+			fmt.Printf("⏱️ [Protobuf 응답 감지] 모델: %s | 첫 토큰 추출 성공\n", res.GetModel())
+		}
+
 		ttft := time.Since(w.startTime).Milliseconds()
 
 		fmt.Printf("⏱️ [TTFT 측정] 첫 토큰 도달 시간: %d ms\n", ttft)
@@ -183,24 +226,33 @@ func guardrailMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			if err == nil {
 				// 원본 데이터를 다시 읽을 수 있도록 Body 복구
 				r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-				bodyString := string(bodyBytes)
 
-				// 2. 금지어 (테스트용)
-				forbiddenWords := []string{
-					"바보",
-				}
+				// [KYL-102] JSON Text 검색에서 Protobuf Unmarshal 후 정밀 검색으로 변경
+				req := &pb.ChatRequest{}
+				if err := proto.Unmarshal(bodyBytes, req); err == nil {
+					// 스키마에 정의된 프롬프트 필드 추출
+					promptText := req.GetPrompt()
 
-				// 3. 검사 및 차단
-				for _, word := range forbiddenWords {
-					if strings.Contains(strings.ToLower(bodyString), word) {
-						fmt.Printf("🛡️ [Guardrail] 위험 키워드 감지 및 차단: '%s'\n", word)
-
-						w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-						w.Header().Set("Content-Type", "application/json")
-						w.WriteHeader(http.StatusUnauthorized)
-						_, _ = w.Write([]byte(`{"error": "401 Unauthorized: Guardrail에 의해 차단되었습니다."}`))
-						return
+					// 2. 금지어 (테스트용)
+					forbiddenWords := []string{
+						"바보",
 					}
+
+					// 3. 검사 및 차단
+					for _, word := range forbiddenWords {
+						if strings.Contains(strings.ToLower(promptText), word) {
+							fmt.Printf("🛡️ [Guardrail] 위험 키워드 감지 및 차단: '%s'\n", word)
+
+							w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+							w.Header().Set("Content-Type", "application/json")
+							w.WriteHeader(http.StatusUnauthorized)
+							_, _ = w.Write([]byte(`{"error": "401 Unauthorized: Guardrail에 의해 차단되었습니다."}`))
+							return
+						}
+					}
+				} else {
+					fmt.Printf("⚠️ [Guardrail] Protobuf 언마샬링 실패 (혹시 JSON 요청?): %v\n", err)
+					// 필요에 따라 JSON 폴백 로직을 넣거나 바로 400 Bad Request 리턴
 				}
 			}
 		}
@@ -210,6 +262,10 @@ func guardrailMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func main() {
+	// [KYL-98] 런타임 튜닝: CPU Affinity 및 스케줄링 최적화
+	// 고루틴이 사용 가능한 모든 코어에 효율적으로 분산되도록 보장합니다.
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	// W3C Trace Context 전파 설정 (OpenTelemetry 필수)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 

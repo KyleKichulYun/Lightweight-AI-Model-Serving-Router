@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package ai.service.v1;
+
+option go_package = "https://github.com/KyleKichulYun/Lightweight-AI-Model-Serving-Router/gen/proto";
+
+// 채팅 요청 메시지
+message ChatRequest {
+  string model_id = 1;
+  string prompt = 2;
+  float temperature = 3;
+  int32 max_tokens = 4;
+  map<string, string> metadata = 5;
+}
+
+// 응답 토큰 (SSE 스트리밍 대응)
+message ChatResponse {
+  string id = 1;
+  string object = 2;
+  int64 created = 3;
+  string model = 4;
+
+  message Choice {
+    string text = 1;
+    int32 index = 2;
+    string finish_reason = 3;
+  }
+
+  repeated Choice choices = 5;
+  Usage usage = 6;
+}
+
+message Usage {
+  int32 prompt_tokens = 1;
+  int32 completion_tokens = 2;
+  int32 total_tokens = 3;
+}

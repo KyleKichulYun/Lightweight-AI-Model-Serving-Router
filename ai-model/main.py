@@ -7,7 +7,7 @@ import networkx as nx
 
 from typing import TypedDict, Annotated, Sequence
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field # Field 임포트 추가
 
@@ -24,6 +24,8 @@ from langchain_community.vectorstores import FAISS # FAISS 임포트 추가
 
 # LangGraph 패키지
 from langgraph.graph import StateGraph, END
+
+import model_service_pb2 as pb
 
 # ==========================================
 # 1. 로깅 및 서버 ID 초기화
@@ -202,15 +204,32 @@ async def generate_chat_stream(user_input: str):
     yield "data: [DONE]\n\n"
 
 @app.post("/api/chat")
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(request: Request):
     current_span = trace.get_current_span()
     trace_id = current_span.get_span_context().trace_id
     trace_id_hex = f"{trace_id:032x}" if trace_id else "No-Trace-ID"
 
     logger.info(f"[{SERVER_ID}] 히뿌푸 채팅 요청 수신! TraceID: {trace_id_hex}")
 
+    # [KYL-107] JSON 대신 Raw Body(Protobuf 바이너리)를 직접 읽음
+    body_bytes = await request.body() # type: ignore
+
+    # Protobuf 객체로 역직렬화
+    chat_request = pb.ChatRequest() # type: ignore
+    try:
+        chat_request.ParseFromString(body_bytes)
+        logger.info(f"[{SERVER_ID}] Protobuf 메시지 파싱 성공! ModelID: {chat_request.model_id}, Prompt: {chat_request.prompt[:30]}... TraceID: {trace_id_hex}")
+    except Exception as e:
+        logger.error(f"[{SERVER_ID}] Protobuf 메시지 파싱 실패: {e} TraceID: {trace_id_hex}")
+        return {"error": "Invalid Protobuf format"}
+    
+    # 추철된 prompt 사용
+    user_input = chat_request.prompt
+    logger.info(f"[{SERVER_ID}] 히뿌푸 바이너리 요청 수신! Prompt: {user_input} | TraceID: {trace_id_hex}")
+
+    # 스트리밍 응답 (SSE는 텍스트 기반이므로 기존 로직 유지)
     return StreamingResponse(
-        generate_chat_stream(request.text),
+        generate_chat_stream(user_input),
         media_type="text/event-stream"
     )
 
@@ -220,7 +239,7 @@ def health_check():
     return {"status": "ok", "server_id": SERVER_ID}
 
 @app.post("/api/summarize")
-def summarize(payload: dict):
+async def summarize(request: Request):
     """
     GPU 연산을 흉내 내는 병목 엔드포인트.
     의도적으로 동기(Sync) 함수로 작성하여 워커 스레드를 3초간 블로킹합니다.
@@ -229,15 +248,23 @@ def summarize(payload: dict):
     trace_id = current_span.get_span_context().trace_id
     trace_id_hex = f"{trace_id:032x}" if trace_id else "No-Trace-ID"
 
+    body_bytes = await request.body()
+    req = pb.ChatRequest() # type: ignore
+    req.ParseFromString(body_bytes)
+    
     logger.info(f"[{SERVER_ID}] 요약 요청 수신. 3초간 처리 중... TraceID: {trace_id_hex}")
     time.sleep(3) # Heavy AI Model Simulation
     
-    text = payload.get("text", "No text provided")
+    text = req.prompt
     logger.info(f"[{SERVER_ID}] 요약 처리 완료. TraceID: {trace_id_hex}")
 
-    return {
-        "server_id": SERVER_ID,
-        "summary": f"[요약 완료] {text[:10]}...",
-        "processing_time": "3s",
-        "trace_id": trace_id_hex
-    }
+    res = pb.ChatResponse() # type: ignore
+    res.server_id = SERVER_ID
+    res.summary = f"[요약 완료] {text[:10]}..."
+    res.processing_time = "3s"
+    res.trace_id = trace_id_hex
+    
+    return Response(
+        content=res.SerializeToString(),
+        media_type="application/x-protobuf"
+    )
